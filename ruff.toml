@@ -1,0 +1,8 @@
+line-length = 120
+
+[lint]
+select = ["E4", "E7", "E9", "F", "I", "B", "C4", "PTH", "RUF", "SIM", "UP"]
+ignore = ["RUF001", "RUF002", "RUF003"]  # 中文全角标点在注释与字符串中是有意为之
+
+[lint.isort]
+known-first-party = ["build_common"]

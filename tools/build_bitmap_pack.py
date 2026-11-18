@@ -1,0 +1,268 @@
+#!/usr/bin/env python3
+"""Build the 4x supersampled bitmap-atlas variant of the font pack.
+
+Requires: fonttools, pillow
+"""
+
+import json
+import math
+import shutil
+import unicodedata
+from collections.abc import Sequence
+from dataclasses import dataclass
+from functools import cache
+
+from fontTools.ttLib import TTFont
+from PIL import Image, ImageDraw, ImageFont
+
+from build_common import (
+    ROOT,
+    SHARED_FILES,
+    check_readme,
+    fail,
+    iter_files,
+    load_pack_meta,
+    output_path,
+    require_file,
+    write_zip,
+)
+
+TTF = ROOT / "assets" / "minecraft" / "font" / "siyuan_hei_sc.ttf"
+PACK_SRC = ROOT / "bitmap"
+BUILD = ROOT / ".work" / "bitmap_build"
+OUTPUT = output_path("Bitmap")
+
+FONT_ID = "siyuan_bitmap"
+COLS = 64
+BMP_MAX = 0xFFFF
+CJK_START = 0x2E80  # 此码位及以上按汉字样式排版（含全角标点、假名）
+HANGUL_JAMO = (0x1100, 0x11FF)
+SPACE = 0x20
+GLYPH_PAD = 12  # 超采样画布四周留白，容纳 ascender/descender 与左侧溢出
+SENTINEL_ALPHA = 1
+
+
+@dataclass(frozen=True)
+class Style:
+    """一套图集参数：4x 单元尺寸、行高与基线的游戏单位、候选字号（从大到小）。"""
+
+    cell: tuple[int, int]
+    height: int
+    ascent: int
+    sizes: tuple[int, ...]
+    max_ink: int
+    max_rows: int
+
+
+LATIN = Style(
+    cell=(36, 48),
+    height=12,
+    ascent=9,
+    sizes=(34, 33, 32, 31, 30, 29, 28),
+    max_ink=36,
+    max_rows=85,
+)
+CJK = Style(
+    cell=(36, 36),
+    height=9,
+    ascent=8,
+    sizes=(32, 31, 30, 29, 28),
+    max_ink=32,
+    max_rows=109,
+)
+
+
+@cache
+def get_font(size: int) -> ImageFont.FreeTypeFont:
+    return ImageFont.truetype(str(TTF), size)
+
+
+def is_cjk(cp: int) -> bool:
+    return cp >= CJK_START or HANGUL_JAMO[0] <= cp <= HANGUL_JAMO[1]
+
+
+def draw_glyph(char: str, style: Style) -> Image.Image | None:
+    """把一个字形渲染成 (cw, cell_h) 的 4x 单元，返回 None 表示当前样式放不下。"""
+    cw, cell_h = style.cell
+    baseline = round(style.ascent * cell_h / style.height)
+
+    for size in style.sizes:
+        font = get_font(size)
+        tmp = Image.new("RGBA", (cw + GLYPH_PAD * 2, cell_h + GLYPH_PAD * 2), (0, 0, 0, 0))
+        draw = ImageDraw.Draw(tmp)
+        try:
+            draw.text((GLYPH_PAD, GLYPH_PAD + baseline), char, font=font, fill=(255, 255, 255, 255), anchor="ls")
+        except (OSError, ValueError):  # 个别字形渲染失败时换更小字号
+            continue
+
+        bbox = tmp.getchannel("A").getbbox()
+        advance = font.getlength(char)
+        if bbox is None:
+            width = min(round(advance), style.max_ink, cw)
+            if width <= 0:
+                return None
+            cell = Image.new("RGBA", (cw, cell_h), (0, 0, 0, 0))
+            cell.putpixel((width - 1, 0), (255, 255, 255, SENTINEL_ALPHA))
+            return cell
+
+        ink_left = bbox[0] - GLYPH_PAD
+        ink_top = bbox[1] - GLYPH_PAD
+        ink_right = bbox[2] - GLYPH_PAD
+        ink_bottom = bbox[3] - GLYPH_PAD
+
+        # 墨迹越过左边界时整幅右移：留白足够，横向溢出总能消解，只需平移不放弃
+        crop_x = GLYPH_PAD
+        if ink_left < 0:
+            crop_x += ink_left
+            ink_right -= ink_left
+        if ink_top < 0 or ink_right > cw or ink_bottom > cell_h:
+            continue
+
+        width = max(ink_right, round(advance))
+        if width > style.max_ink or width > cw:
+            continue
+        cell = tmp.crop((crop_x, GLYPH_PAD, crop_x + cw, GLYPH_PAD + cell_h))
+        if width > 0 and cell.getpixel((width - 1, 0))[3] == 0:
+            # Minecraft 按最右非透明列推算字宽，用一个几乎不可见的像素把宽度撑到目标值
+            cell.putpixel((width - 1, 0), (255, 255, 255, SENTINEL_ALPHA))
+        return cell
+
+    return None
+
+
+def build_pages(
+    chars: Sequence[int], style: Style, page_start: int
+) -> tuple[list[dict[str, object]], int, list[int], int]:
+    cw, cell_h = style.cell
+    capacity = COLS * style.max_rows
+    providers: list[dict[str, object]] = []
+    mapped = 0
+    skipped: list[int] = []
+    page_no = page_start
+
+    for offset in range(0, len(chars), capacity):
+        chunk = chars[offset : offset + capacity]
+        rows = math.ceil(len(chunk) / COLS)
+        atlas = Image.new("RGBA", (COLS * cw, rows * cell_h), (0, 0, 0, 0))
+        grid = [["\u0000"] * COLS for _ in range(rows)]
+        page_mapped = 0
+
+        for i, cp in enumerate(chunk):
+            char = chr(cp)
+            cell = draw_glyph(char, style)
+            if cell is None:
+                skipped.append(cp)
+                continue
+            col, row = i % COLS, i // COLS
+            atlas.alpha_composite(cell, (col * cw, row * cell_h))
+            grid[row][col] = char
+            page_mapped += 1
+
+        filename = f"{FONT_ID}_{page_no:02d}.png"
+        atlas.save(BUILD / "assets" / "minecraft" / "textures" / "font" / filename, compress_level=6)
+        providers.append(
+            {
+                "type": "bitmap",
+                "file": f"minecraft:font/{filename}",
+                "height": style.height,
+                "ascent": style.ascent,
+                "chars": ["".join(row) for row in grid],
+            }
+        )
+        print(f"  page {filename}: {page_mapped} glyphs, {rows}x{COLS} cells, {atlas.width}x{atlas.height}px")
+        mapped += page_mapped
+        page_no += 1
+
+    return providers, mapped, skipped, page_no
+
+
+def main() -> None:
+    # 廉价校验全部前置，避免几分钟图集生成之后才发现缺文件
+    check_readme(OUTPUT)
+    require_file(TTF, "source font")
+    load_pack_meta(PACK_SRC / "pack.mcmeta", "bitmap/pack.mcmeta")
+    require_file(PACK_SRC / "pack.png", "bitmap/pack.png")
+    for name in SHARED_FILES:
+        require_file(ROOT / name)
+
+    with TTFont(TTF) as font:
+        cmap = font.getBestCmap()
+    if not cmap:
+        fail(f"{TTF.name} has no usable cmap")
+
+    bmp = []
+    for cp in sorted(cmap):
+        if cp > BMP_MAX:
+            continue
+        char = chr(cp)
+        category = unicodedata.category(char)
+        if category in ("Cc", "Cs", "Cf", "Co", "Cn", "Zl", "Zp") or category.startswith("M"):
+            continue
+        if cp == SPACE:  # 空格无墨迹，交由 vanilla 的 include/space 提供
+            continue
+        bmp.append(cp)
+
+    latin_chars = [cp for cp in bmp if not is_cjk(cp)]
+    cjk_chars = [cp for cp in bmp if is_cjk(cp)]
+    print(f"BMP characters: {len(bmp)} (latin/symbols {len(latin_chars)}, CJK {len(cjk_chars)})")
+
+    if BUILD.is_dir():
+        shutil.rmtree(BUILD)
+    (BUILD / "assets" / "minecraft" / "font").mkdir(parents=True)
+    (BUILD / "assets" / "minecraft" / "textures" / "font").mkdir(parents=True)
+
+    providers: list[dict[str, object]] = []
+    all_mapped = 0
+    all_skipped: list[int] = []
+    next_page = 0
+    for style, chars in ((LATIN, latin_chars), (CJK, cjk_chars)):
+        pages, mapped, skipped, next_page = build_pages(chars, style, next_page)
+        providers.extend(pages)
+        all_mapped += mapped
+        all_skipped.extend(skipped)
+
+    bitmap_font = {"providers": providers}
+    (BUILD / "assets" / "minecraft" / "font" / f"{FONT_ID}.json").write_text(
+        json.dumps(bitmap_font, ensure_ascii=True, separators=(",", ":")),
+        encoding="utf-8",
+    )
+
+    default_font = {
+        "providers": [
+            {"type": "reference", "id": "minecraft:include/space"},
+            {
+                "type": "reference",
+                "id": f"minecraft:{FONT_ID}",
+                "filter": {"uniform": False},
+            },
+            {
+                "type": "reference",
+                "id": "minecraft:include/default",
+                "filter": {"uniform": False},
+            },
+            {"type": "reference", "id": "minecraft:include/unifont"},
+        ]
+    }
+    (BUILD / "assets" / "minecraft" / "font" / "default.json").write_text(
+        json.dumps(default_font, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+    )
+
+    vram = 0
+    for path in (BUILD / "assets" / "minecraft" / "textures" / "font").glob("*.png"):
+        with Image.open(path) as img:
+            vram += img.width * img.height * 4
+
+    print(f"mapped {all_mapped} glyphs, skipped {len(all_skipped)}")
+    if all_skipped:
+        sample = " ".join(f"U+{cp:04X}" for cp in all_skipped[:20])
+        print(f"skipped sample (fall back to unifont): {sample}")
+    print(f"atlas pages: {len(providers)}, uncompressed atlas data: {vram / 1024 / 1024:.0f} MiB (RAM)")
+
+    entries = iter_files(BUILD, BUILD)
+    entries += [(PACK_SRC / "pack.mcmeta", "pack.mcmeta"), (PACK_SRC / "pack.png", "pack.png")]
+    entries += [(ROOT / name, name) for name in SHARED_FILES]
+    write_zip(OUTPUT, entries, compresslevel=6)
+
+
+if __name__ == "__main__":
+    main()
