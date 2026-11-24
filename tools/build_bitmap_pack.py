@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""Build the 4x supersampled bitmap-atlas variant of the font pack.
+"""Build font resource packs sharing a 4x supersampled bitmap atlas.
 
 Requires: fonttools, pillow
 """
 
+import argparse
 import json
 import math
 import shutil
@@ -11,6 +12,7 @@ import unicodedata
 from collections.abc import Sequence
 from dataclasses import dataclass
 from functools import cache
+from pathlib import Path
 
 from fontTools.ttLib import TTFont
 from PIL import Image, ImageDraw, ImageFont
@@ -18,19 +20,21 @@ from PIL import Image, ImageDraw, ImageFont
 from build_common import (
     ROOT,
     SHARED_FILES,
+    TARGETS,
+    Target,
     check_readme,
     fail,
     iter_files,
-    load_pack_meta,
     output_path,
+    pack_meta,
     require_file,
     write_zip,
 )
 
 TTF = ROOT / "assets" / "minecraft" / "font" / "siyuan_hei_sc.ttf"
-PACK_SRC = ROOT / "bitmap"
-BUILD = ROOT / ".work" / "bitmap_build"
-OUTPUT = output_path()
+PACK_PNG = ROOT / "bitmap" / "pack.png"
+BUILD = ROOT / ".work" / "bitmap_build"  # 各目标共用的图集
+CONFIG_BUILD = ROOT / ".work" / "bitmap_targets"  # 各目标的 pack.mcmeta 与 default.json
 
 FONT_ID = "siyuan_bitmap"
 COLS = 64
@@ -81,6 +85,39 @@ PUNCTUATION = Style(
     max_ink=33,
     max_rows=102,
 )
+
+
+def font_config(target: Target) -> dict[str, object]:
+    """默认字体配置：只有在目标版本支持字体提供器 filter 时才启用。"""
+    providers: list[dict[str, object]] = [{"type": "reference", "id": "minecraft:include/space"}]
+    for font in (f"minecraft:{FONT_ID}", "minecraft:include/default"):
+        provider: dict[str, object] = {"type": "reference", "id": font}
+        if target.uniform_filter:
+            provider["filter"] = {"uniform": False}
+        providers.append(provider)
+    providers.append({"type": "reference", "id": "minecraft:include/unifont"})
+    return {"providers": providers}
+
+
+def reset_dir(path: Path) -> None:
+    if path.is_dir():
+        if path.resolve().parent != (ROOT / ".work").resolve():
+            fail(f"build directory must be directly inside {ROOT / '.work'}")
+        shutil.rmtree(path)
+
+
+def write_json(path: Path, data: object) -> None:
+    path.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+
+def write_target_config(target: Target) -> Path:
+    """把目标独有的元数据和字体配置写入独立目录，避免混入其他目标的 ZIP。"""
+    root = CONFIG_BUILD / target.name
+    font_dir = root / "assets" / "minecraft" / "font"
+    font_dir.mkdir(parents=True)
+    write_json(root / "pack.mcmeta", pack_meta(target))
+    write_json(font_dir / "default.json", font_config(target))
+    return root
 
 
 def adjust_spacing(
@@ -217,12 +254,26 @@ def build_pages(
     return providers, mapped, skipped, page_no
 
 
+def parse_targets(argv: Sequence[str] | None = None) -> list[Target]:
+    """默认构建全部资源包；指定 --target 时只构建对应版本范围。"""
+    parser = argparse.ArgumentParser(description="构建思源黑体位图资源包")
+    parser.add_argument(
+        "--target",
+        choices=TARGETS,
+        help="只构建指定目标；默认构建全部资源包",
+    )
+    args = parser.parse_args(argv)
+    return [TARGETS[args.target]] if args.target else list(TARGETS.values())
+
+
 def main() -> None:
+    targets = parse_targets()
+
     # 廉价校验全部前置，避免几分钟图集生成之后才发现缺文件
-    check_readme(OUTPUT)
+    for target in targets:
+        check_readme(output_path(target))
     require_file(TTF, "source font")
-    load_pack_meta(PACK_SRC / "pack.mcmeta", "bitmap/pack.mcmeta")
-    require_file(PACK_SRC / "pack.png", "bitmap/pack.png")
+    require_file(PACK_PNG, "bitmap/pack.png")
     for name in SHARED_FILES:
         require_file(ROOT / name)
 
@@ -247,10 +298,8 @@ def main() -> None:
     cjk_chars = [cp for cp in bmp if is_cjk(cp)]
     print(f"BMP characters: {len(bmp)} (latin/symbols {len(latin_chars)}, CJK {len(cjk_chars)})")
 
-    if BUILD.is_dir():
-        if BUILD.resolve().parent != (ROOT / ".work").resolve():
-            fail(f"build directory must be directly inside {ROOT / '.work'}")
-        shutil.rmtree(BUILD)
+    reset_dir(BUILD)
+    reset_dir(CONFIG_BUILD)
     (BUILD / "assets" / "minecraft" / "font").mkdir(parents=True)
     (BUILD / "assets" / "minecraft" / "textures" / "font").mkdir(parents=True)
 
@@ -275,26 +324,6 @@ def main() -> None:
         encoding="utf-8",
     )
 
-    default_font = {
-        "providers": [
-            {"type": "reference", "id": "minecraft:include/space"},
-            {
-                "type": "reference",
-                "id": f"minecraft:{FONT_ID}",
-                "filter": {"uniform": False},
-            },
-            {
-                "type": "reference",
-                "id": "minecraft:include/default",
-                "filter": {"uniform": False},
-            },
-            {"type": "reference", "id": "minecraft:include/unifont"},
-        ]
-    }
-    (BUILD / "assets" / "minecraft" / "font" / "default.json").write_text(
-        json.dumps(default_font, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
-    )
-
     vram = 0
     for path in (BUILD / "assets" / "minecraft" / "textures" / "font").glob("*.png"):
         with Image.open(path) as img:
@@ -306,10 +335,13 @@ def main() -> None:
         print(f"skipped sample (fall back to unifont): {sample}")
     print(f"atlas pages: {len(providers)}, uncompressed atlas data: {vram / 1024 / 1024:.0f} MiB (RAM)")
 
-    entries = iter_files(BUILD, BUILD)
-    entries += [(PACK_SRC / "pack.mcmeta", "pack.mcmeta"), (PACK_SRC / "pack.png", "pack.png")]
-    entries += [(ROOT / name, name) for name in SHARED_FILES]
-    write_zip(OUTPUT, entries, compresslevel=6)
+    shared_entries = [*iter_files(BUILD, BUILD), (PACK_PNG, "pack.png")]
+    shared_entries += [(ROOT / name, name) for name in SHARED_FILES]
+    for target in targets:
+        config_root = write_target_config(target)
+        entries = shared_entries + iter_files(config_root, config_root)
+        print(f"packing target {target.name} (game versions: {', '.join(target.versions)})")
+        write_zip(output_path(target), entries, compresslevel=6)
 
 
 if __name__ == "__main__":
