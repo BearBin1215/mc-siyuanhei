@@ -8,11 +8,11 @@ from pathlib import Path
 from typing import NoReturn
 
 ROOT = Path(__file__).resolve().parent.parent
-VERSION = "0.1.0"
+VERSION = "0.2.0"
 VERSION_PLACEHOLDER = "<version>"  # README 里代替具体版本号
 PACK_FORMAT = 84
 FIXED_DATE_TIME = (1980, 1, 1, 0, 0, 0)
-SHARED_FILES = ("README.md", "LICENSE", "LICENSE-OFL.txt")  # 两个变体都随包分发
+SHARED_FILES = ("README.md", "LICENSE", "LICENSE-OFL.txt")  # 随资源包分发
 
 
 def fail(message: str) -> NoReturn:
@@ -20,8 +20,8 @@ def fail(message: str) -> NoReturn:
     sys.exit(1)
 
 
-def output_path(variant: str) -> Path:
-    return ROOT / "dist" / f"SiyuanHei-SC-{variant}-MC26.1-v{VERSION}.zip"
+def output_path() -> Path:
+    return ROOT / "dist" / f"SiyuanHei-SC-MC26.1-v{VERSION}.zip"
 
 
 def require_file(path: Path, label: str = "") -> None:

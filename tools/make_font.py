@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Convert an official CFF-outline OTF into a TrueType-outline TTF.
+"""Convert an official CFF-outline OTF into the TrueType TTF used as bitmap source.
 
-Minecraft 26.1 的 `ttf` 字体提供器只接受 TrueType 轮廓，官方发行版是 CFF 轮廓的 OTF，
-所以要把三次贝塞尔转成二次贝塞尔（glyf）。转换后的字体按 OFL 保留字体名条款改名。
+位图构建用 Pillow 从这份 TTF 采样字形；转换把三次贝塞尔改成二次贝塞尔（glyf），
+去掉采样用不到的排版表，并按 OFL 保留字体名条款改名。
 
 Requires: fonttools
 """

@@ -30,7 +30,7 @@ from build_common import (
 TTF = ROOT / "assets" / "minecraft" / "font" / "siyuan_hei_sc.ttf"
 PACK_SRC = ROOT / "bitmap"
 BUILD = ROOT / ".work" / "bitmap_build"
-OUTPUT = output_path("Bitmap")
+OUTPUT = output_path()
 
 FONT_ID = "siyuan_bitmap"
 COLS = 64
@@ -40,6 +40,9 @@ HANGUL_JAMO = (0x1100, 0x11FF)
 SPACE = 0x20
 GLYPH_PAD = 12  # 超采样画布四周留白，容纳 ascender/descender 与左侧溢出
 SENTINEL_ALPHA = 1
+CJK_OPEN = frozenset("（［｛「『【〈《〔")
+CJK_CLOSE = frozenset("）］｝」』】〉》〕")
+CJK_PUNCTUATION = CJK_OPEN | CJK_CLOSE | frozenset("、。，．！？：；")
 
 
 @dataclass(frozen=True)
@@ -66,10 +69,46 @@ CJK = Style(
     cell=(36, 36),
     height=9,
     ascent=8,
-    sizes=(32, 31, 30, 29, 28),
-    max_ink=32,
+    sizes=(33, 32, 31, 30, 29, 28),
+    max_ink=33,
     max_rows=109,
 )
+PUNCTUATION = Style(
+    cell=(36, 40),
+    height=10,
+    ascent=8,
+    sizes=(33, 32, 31, 30, 29, 28),
+    max_ink=33,
+    max_rows=102,
+)
+
+
+def adjust_spacing(
+    char: str, cell: Image.Image, ink_left: int, ink_right: int, width: int, style: Style
+) -> tuple[Image.Image, int]:
+    """保留全部笔画，减少英文留白，并为中文标点设置占位与对齐。"""
+    if char in CJK_PUNCTUATION:
+        # 标点目标步进为 6px；4x 图集中宽度 20px 经游戏取整并加 1 后得到 6px。
+        width = 20
+        ink_width = ink_right - ink_left
+        if ink_width > width:
+            return cell, max(width, ink_right)
+        if char in CJK_OPEN:
+            target_left = width - ink_width  # 开括号靠近后面的文字
+        elif char in CJK_CLOSE:
+            target_left = 0  # 闭括号靠近前面的文字
+        else:
+            target_left = min(max(ink_left, 0), 2)
+        shift = target_left - ink_left
+    elif style == LATIN and char not in "0123456789":
+        # 最多去掉 0.5px 左侧留白；字宽补偿位图提供器额外加的 1px，且不裁笔画。
+        shift = -min(max(ink_left, 0), 2)
+        width = max(ink_right + shift, width - 4)
+    else:
+        return cell, width
+    shifted = Image.new("RGBA", cell.size, (0, 0, 0, 0))
+    shifted.alpha_composite(cell, (shift, 0))
+    return shifted, width
 
 
 @cache
@@ -115,6 +154,7 @@ def draw_glyph(char: str, style: Style) -> Image.Image | None:
         if ink_left < 0:
             crop_x += ink_left
             ink_right -= ink_left
+            ink_left = 0
         if ink_top < 0 or ink_right > cw or ink_bottom > cell_h:
             continue
 
@@ -122,6 +162,7 @@ def draw_glyph(char: str, style: Style) -> Image.Image | None:
         if width > style.max_ink or width > cw:
             continue
         cell = tmp.crop((crop_x, GLYPH_PAD, crop_x + cw, GLYPH_PAD + cell_h))
+        cell, width = adjust_spacing(char, cell, ink_left, ink_right, width, style)
         if width > 0 and cell.getpixel((width - 1, 0))[3] == 0:
             # Minecraft 按最右非透明列推算字宽，用一个几乎不可见的像素把宽度撑到目标值
             cell.putpixel((width - 1, 0), (255, 255, 255, SENTINEL_ALPHA))
@@ -207,6 +248,8 @@ def main() -> None:
     print(f"BMP characters: {len(bmp)} (latin/symbols {len(latin_chars)}, CJK {len(cjk_chars)})")
 
     if BUILD.is_dir():
+        if BUILD.resolve().parent != (ROOT / ".work").resolve():
+            fail(f"build directory must be directly inside {ROOT / '.work'}")
         shutil.rmtree(BUILD)
     (BUILD / "assets" / "minecraft" / "font").mkdir(parents=True)
     (BUILD / "assets" / "minecraft" / "textures" / "font").mkdir(parents=True)
@@ -215,7 +258,12 @@ def main() -> None:
     all_mapped = 0
     all_skipped: list[int] = []
     next_page = 0
-    for style, chars in ((LATIN, latin_chars), (CJK, cjk_chars)):
+    groups = [
+        (LATIN, latin_chars),
+        (CJK, [cp for cp in cjk_chars if chr(cp) not in CJK_PUNCTUATION]),
+        (PUNCTUATION, [cp for cp in cjk_chars if chr(cp) in CJK_PUNCTUATION]),
+    ]
+    for style, chars in groups:
         pages, mapped, skipped, next_page = build_pages(chars, style, next_page)
         providers.extend(pages)
         all_mapped += mapped
